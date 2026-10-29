@@ -9,7 +9,7 @@ $ErrorActionPreference = "Continue"
 
 $imports = @{
     "sageattention" = "import sageattention, sageattention._fused, sageattention._qattn_sm80, sageattention._qattn_sm89, sageattention._qattn_sm90; from sageattention import sageattn; print('sageattention', sageattention.__file__)"
-    "sageattn3"     = "import torch; from sageattn3 import sageattn3_blackwell; import sageattn3; print('sageattn3 ok', [o for o in ('sageattn3_fp4attn_cuda','sageattn3_fp4quant_cuda') if hasattr(torch.ops, o)])"
+    "sageattn3"     = "import torch; from sageattn3 import sageattn3_blackwell; import fp4attn_cuda, fp4quant_cuda; print('sageattn3 ok', fp4attn_cuda.fwd.__name__, fp4quant_cuda.scaled_fp4_quant.__name__, fp4attn_cuda.__file__)"
     "nunchaku"      = "import nunchaku, nunchaku._C; from nunchaku import NunchakuFluxTransformer2dModel; print('nunchaku', nunchaku._C.__file__)"
     "flash_attn"    = "import flash_attn, flash_attn_2_cuda; from flash_attn import flash_attn_func; print('flash_attn', flash_attn.__version__, flash_attn_2_cuda.__file__)"
 }
@@ -45,7 +45,9 @@ foreach ($whl in @(Get-ChildItem "$Root\wheels\*.whl")) {
         if ($deps -match 'cudart64_12|cublas64_12') { Log "!! CUDA 12 DEPENDENCY" }
         $elf = cuobjdump --list-elf $pyd.FullName 2>&1 | ForEach-Object { if ($_ -match 'sm_\d+a?') { $Matches[0] } } | Sort-Object -Unique
         $ptx = cuobjdump --list-ptx $pyd.FullName 2>&1 | ForEach-Object { if ($_ -match 'sm_\d+a?') { $Matches[0] } } | Sort-Object -Unique
-        Log ("SASS: " + ($elf -join ' ') + "   PTX: " + ($ptx -join ' '))
+        $kernels = @(cuobjdump -sass $pyd.FullName 2>&1 | Select-String '^\s+Function : ').Count
+        $exports = dumpbin /nologo /exports $pyd.FullName | Select-String 'PyInit_\w+' | ForEach-Object { $_.Matches[0].Value }
+        Log ("SASS: " + ($elf -join ' ') + "   PTX: " + ($ptx -join ' ') + "   kernels: $kernels   exports: " + ($exports -join ' '))
     }
 }
 "report: $Report"

@@ -1,0 +1,88 @@
+diff --git a/sageattention3_blackwell/sageattn3/blackwell/kernel_ws.h b/sageattention3_blackwell/sageattn3/blackwell/kernel_ws.h
+index 5adc82a..ddcff68 100644
+--- a/sageattention3_blackwell/sageattn3/blackwell/kernel_ws.h
++++ b/sageattention3_blackwell/sageattn3/blackwell/kernel_ws.h
+@@ -37,13 +37,13 @@ namespace flash {
+ 
+ using namespace cute;
+ 
++// [windows-torch-cuda-wheels] kernel body moved to compute_attn_ws_impl; the __global__ wrappers are at the end of the file
+ template <typename Ktraits, bool Is_causal, typename TileScheduler>
+-__global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
+-    compute_attn_ws(CUTE_GRID_CONSTANT Flash_fwd_params const params,
+-                    CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const mainloop_params,
+-                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits>::Params const epilogue_params,
+-                    CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params
+-                    ) {
++__device__ inline void
++compute_attn_ws_impl(Flash_fwd_params const &params,
++                     typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const &mainloop_params,
++                     typename CollectiveEpilogueFwd<Ktraits>::Params const &epilogue_params,
++                     typename TileScheduler::Params const &scheduler_params) {
+ 
+     using Element = typename Ktraits::Element;
+     using ElementAccum = typename Ktraits::ElementAccum;
+@@ -199,4 +199,29 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
+     }
+ }
+ 
++#if defined(_MSC_VER)
++// MSVC: parameters are passed through device memory (see launch.h); by-value __grid_constant__
++// parameters fault with "misaligned address" in Windows builds.
++template <typename Ktraits, bool Is_causal, typename TileScheduler>
++__global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
++compute_attn_ws(Flash_fwd_params const *params,
++                typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const *mainloop_params,
++                typename CollectiveEpilogueFwd<Ktraits>::Params const *epilogue_params,
++                typename TileScheduler::Params const *scheduler_params) {
++    compute_attn_ws_impl<Ktraits, Is_causal, TileScheduler>(
++        *params, *mainloop_params, *epilogue_params, *scheduler_params);
++}
++#else
++template <typename Ktraits, bool Is_causal, typename TileScheduler>
++__global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
++    compute_attn_ws(CUTE_GRID_CONSTANT Flash_fwd_params const params,
++                    CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const mainloop_params,
++                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits>::Params const epilogue_params,
++                    CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params
++                    ) {
++    compute_attn_ws_impl<Ktraits, Is_causal, TileScheduler>(
++        params, mainloop_params, epilogue_params, scheduler_params);
++}
++#endif  // _MSC_VER
++
+ } // namespace flash
+diff --git a/sageattention3_blackwell/sageattn3/blackwell/launch.h b/sageattention3_blackwell/sageattn3/blackwell/launch.h
+index 3167df3..5dfbd3c 100644
+--- a/sageattention3_blackwell/sageattn3/blackwell/launch.h
++++ b/sageattention3_blackwell/sageattn3/blackwell/launch.h
+@@ -90,7 +90,29 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     dim3 block_dims(ctaSize);
+     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
+     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
++#if defined(_MSC_VER)
++    // [windows-torch-cuda-wheels] MSVC: copy the parameter structs into one stream-ordered device buffer and pass pointers
++    struct DeviceParamsPack {
++        Flash_fwd_params params;
++        typename CollectiveMainloop::Params mainloop;
++        typename CollectiveEpilogue::Params epilogue;
++        typename Scheduler::Params scheduler;
++    };
++    DeviceParamsPack h_pack{params, mainloop_params, epilogue_params, scheduler_params};
++    DeviceParamsPack *d_pack = nullptr;
++    C10_CUDA_CHECK(cudaMallocAsync(&d_pack, sizeof(DeviceParamsPack), stream));
++    C10_CUDA_CHECK(cudaMemcpyAsync(d_pack, &h_pack, sizeof(DeviceParamsPack), cudaMemcpyHostToDevice, stream));
++    // launch_kernel_on_cluster takes the address of each argument, so they must be lvalues
++    auto *d_params = &d_pack->params;
++    auto *d_mainloop_params = &d_pack->mainloop;
++    auto *d_epilogue_params = &d_pack->epilogue;
++    auto *d_scheduler_params = &d_pack->scheduler;
++    cutlass::launch_kernel_on_cluster(launch_params, kernel,
++        d_params, d_mainloop_params, d_epilogue_params, d_scheduler_params);
++    C10_CUDA_CHECK(cudaFreeAsync(d_pack, stream));
++#else
+     cutlass::launch_kernel_on_cluster(launch_params, kernel, params, mainloop_params, epilogue_params, scheduler_params);
++#endif
+     
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }

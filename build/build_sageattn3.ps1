@@ -1,21 +1,34 @@
-# SageAttention 3 (sageattn3, Blackwell FP4) -> abi3 wheel, sm_120a only.
-# Built from the Windows-ported copy in woct0rdho/SageAttention (same kernels as
-# thu-ml/SageAttention sageattention3_blackwell, wrapped as TORCH_LIBRARY ops; CUTLASS pinned as submodule).
-param([string]$Root = "C:\b", [int]$MaxJobs = 4)
+# SageAttention 3 (sageattn3, Blackwell FP4) -> cp313 wheel, sm_120a only.
+# Built from thu-ml/SageAttention sageattention3_blackwell with upstream's nvcc flags, CUTLASS pinned to the
+# main commit upstream's unpinned `git clone --depth 1` fetched when sageattention3_blackwell last changed
+# (2025-12-22), and the patches applied by patch_sageattn3.py.
+param([string]$Root = "C:\b", [int]$MaxJobs = 2)
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\env.ps1" -Root $Root -MaxJobs $MaxJobs
 
-$repo = "$Root\src\sage2"
+$repo = "$Root\src\sage3"
+$sageCommit = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+$cutlassCommit = "7f5fe3edf123a336bf59b96e02cac7b13472aebd"   # NVIDIA/cutlass main "v4.3.4 update. (#2892)"
+$ErrorActionPreference = "Continue"   # git writes progress to stderr (PS 5.1)
 if (-not (Test-Path $repo)) {
-    git clone --depth 1 --branch v2.2.0-windows.post7 https://github.com/woct0rdho/SageAttention $repo
+    git init -q $repo
+    git -C $repo fetch -q --depth 1 https://github.com/thu-ml/SageAttention $sageCommit
+    git -C $repo checkout -q FETCH_HEAD
 }
-git -C $repo submodule update --init --depth 1 sageattention3_blackwell/cutlass
+$cutlass = "$repo\sageattention3_blackwell\csrc\cutlass"
+if (-not (Test-Path $cutlass)) {
+    git init -q $cutlass
+    git -C $cutlass fetch -q --depth 1 https://github.com/NVIDIA/cutlass.git $cutlassCommit
+    git -C $cutlass checkout -q FETCH_HEAD
+}
+$ErrorActionPreference = "Stop"
+if ((git -C $cutlass rev-parse HEAD) -ne $cutlassCommit) { throw "CUTLASS is not at $cutlassCommit" }
 python -I "$PSScriptRoot\patch_sageattn3.py" $repo
 # The subproject has no LICENSE of its own; ship the repo's Apache-2.0 licence in the wheel's dist-info.
 Copy-Item "$repo\LICENSE" "$repo\sageattention3_blackwell\LICENSE" -Force
 
-$env:TORCH_CUDA_ARCH_LIST = "12.0"
-$env:SAGEATTENTION_WHEEL_VERSION_SUFFIX = "+cu134torch2.15.0"
+$env:TORCH_CUDA_ARCH_LIST = "12.0"   # -> -gencode arch=compute_120a,code=sm_120a (upstream's sm_120 branch)
+$env:SAGEATTN3_VERSION_SUFFIX = ".post1+cu134torch2.15.0"
 
 Push-Location "$repo\sageattention3_blackwell"
 try {

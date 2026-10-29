@@ -40,22 +40,61 @@ This is the same layout the installer produces (`bin/`, `include/`, `lib/x64/`, 
 | Package | Source | Arch flags | MAX_JOBS | Build time |
 |---|---|---|---|---|
 | sageattention 2.2.0.post7 | woct0rdho/SageAttention `v2.2.0-windows.post7` (`79cd62a`) | `TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 12.0"` (upstream CI list) | 4 | 8 min |
-| sageattn3 1.0.0 | woct0rdho/SageAttention `v2.2.0-windows.post7` (`79cd62a`), `sageattention3_blackwell/`, CUTLASS submodule `f3fde58` | `TORCH_CUDA_ARCH_LIST="12.0"` → `sm_120a` | 1–2 | 6 min (13 min for the rebuild that ran alongside flash-attn) |
+| sageattn3 1.0.0.post1 | thu-ml/SageAttention `d1a57a5`, `sageattention3_blackwell/`, CUTLASS `7f5fe3e` | `TORCH_CUDA_ARCH_LIST="12.0"` → upstream's `arch=compute_120a,code=sm_120a` | 2 | 8 min |
 | nunchaku 1.3.0.dev20260906 | nunchux-ai/nunchaku `main` @ `302e0e9` (2026-09-06) | `NUNCHAKU_SM_TARGETS=120a` (patch) | 3 | 20 min |
 | flash_attn 2.8.3.post2 | Dao-AILab/flash-attention `v2.8.3.post2` (`49774b3`) | `FLASH_ATTN_CUDA_ARCHS=120` → `sm_120` | 4 | 57 min |
 
 All wheels: SASS only (no PTX), so they run on compute capability 12.0 GPUs (RTX 50xx) — plus, for
 sageattention, sm80/86/89/90 as upstream ships. They will not JIT on other archs.
 
-### Why sageattn3 is built from the woct0rdho fork
+### sageattn3 1.0.0.post1
 
-The user-specified source was `thu-ml/SageAttention/sageattention3_blackwell` (HEAD `d1a57a5`). That
-`setup.py` cannot build on this machine as-is: it calls `torch.cuda.get_device_capability()` (needs a GPU)
-and `git clone`s an unpinned CUTLASS at build time. woct0rdho's Windows-maintained fork carries the same
-directory with **identical CUDA kernels** (verified with `diff`); its changes are only packaging:
-entry points re-wrapped as `TORCH_LIBRARY` ops (`torch.ops.sageattn3_fp4attn_cuda`,
-`torch.ops.sageattn3_fp4quant_cuda`) so the wheel is `abi3`, `TORCH_CUDA_ARCH_LIST` support, MSVC flags,
-and CUTLASS pinned as a submodule. Import name and API are unchanged: `from sageattn3 import sageattn3_blackwell`.
+The first upload, `sageattn3-1.0.0+cu134torch2.15.0`, imported fine but `fp4attn_cuda.fwd` failed on the RTX 5080
+with `CUDA error: misaligned address` for every shape (`fp4quant_cuda` worked). It had been built from
+woct0rdho's repackaging of `sageattention3_blackwell` (TORCH_LIBRARY ops, abi3). The earlier claim here that its
+kernels were identical to thu-ml's was wrong: `kernel_traits.h` and the bindings differ too.
+
+Root cause, from comparing against the known-good `sageattn3-1.0.0+cu132torch2.14.0` Windows wheel (ussoewwin,
+Hugging Face `ussoewwin/Sage-Attention-for-Windows`). Same 16 attention kernel instantiations (2 head dims ×
+2 × bf16/fp16 × causal), so nothing was missing. Its 20 MB `fp4attn_cuda` holds sm_100a + sm_120a + sm_121a and
+`-lineinfo`, about 6.7 MB per arch. **The kernel signatures differ, though:**
+
+    reference:  compute_attn_ws<...>(Flash_fwd_params const*, CollectiveMainloopFwd<...>::Params const*, ...)
+    1.0.0:      compute_attn_ws<...>(Flash_fwd_params, CollectiveMainloopFwd<...>::Params, ...)   // __grid_constant__ by value
+
+The parameter structs hold the TMA descriptors (`CUtensorMap`, which must be 64-byte aligned). With MSVC the
+by-value launch faults. The fix comes from Jianqiao Huang in
+[mengqin/SageAttention `8bb81e4a`](https://github.com/mengqin/SageAttention/commit/8bb81e4a), "corrected the MSVC
+parameter passing method", which ussoewwin's fork merges. Under `_MSC_VER` it copies the four structs into one
+`cudaMallocAsync` buffer on the launch stream and passes pointers.
+
+post1 is therefore built from **thu-ml/SageAttention `sageattention3_blackwell` @ `d1a57a5`**. It keeps upstream's
+nvcc flags (`-O3 --use_fast_math -lineinfo -DQBLKSIZE=128 -DKBLKSIZE=128 -DCTA256 -DDQINRMEM -DNDEBUG
+-DEXECMODE=0 --threads 4`, `-gencode arch=compute_120a,code=sm_120a`), upstream's pybind11 modules (`fp4attn_cuda`,
+`fp4quant_cuda`, installed top-level as upstream's `api.py` imports them) and upstream's Python code, plus:
+
+- `sageattn3-setup-gpuless-cutlass-pin-cxx20.patch` (setup.py):
+  - target from `TORCH_CUDA_ARCH_LIST` instead of `torch.cuda.get_device_capability()`;
+  - no unpinned `git clone cutlass` at build time;
+  - `-std=c++20` instead of `-std=c++17`, plus `-Xcompiler /Zc:preprocessor /Zc:__cplusplus`. Both are required:
+    torch 2.15 headers need C++20, and CUDA 13 CCCL needs the conforming preprocessor;
+  - a version suffix.
+- `sageattn3-msvc-kernel-params-by-pointer.patch`: the kernel/launch part of mengqin `8bb81e4a`. It is MSVC-only,
+  and Linux builds still use `__grid_constant__`.
+- CUTLASS pinned to **`7f5fe3edf123a336bf59b96e02cac7b13472aebd`** ("v4.3.4 update", main, 2025-12-21). Upstream's
+  setup does `git clone --depth 1` of CUTLASS main and pins nothing. This is the commit that clone fetched when
+  thu-ml last changed `sageattention3_blackwell` (`c03f15f`, 2025-12-22).
+- The `PyMODINIT_FUNC` patch from 1.0.0 is not needed. Upstream uses `PYBIND11_MODULE`, which already exports
+  `PyInit_*` with dllexport (checked with `dumpbin /exports`).
+- MSVC 14.51 (VS 2026) was kept. The failure was the parameter-passing ABI, not the compiler version, so the
+  VS 2022 v143 toolset was not needed.
+
+cubin comparison (sm_120a, `cuobjdump -sass` / `-res-usage`), post1 vs the reference:
+- `fp4attn_cuda`: the same 16 mangled kernel names, now with the pointer signature. Each uses 168 registers,
+  1024 B static smem and 0 local memory, as in the reference. Stack is 0/48–56 B vs 0–32/224 B, since nvcc 13.4
+  differs from 13.2.
+- `fp4quant_cuda`: the same 12 kernels with identical register, stack and shared-memory usage.
+- The reference also has cub's empty placeholder kernel (`cub::detail::EmptyKernel`) from CUDA 13.2's CCCL.
 
 ## Patches (all in `patches/`, applied by the `build/patch_*.py` scripts)
 
@@ -67,13 +106,9 @@ and CUTLASS pinned as a submodule. Import name and API are unchanged: `from sage
    (spdlog v1.14.1's bundled fmt): nvcc 13.4's front end rejects `U"\x9999999a..."` char32_t escapes above
    U+10FFFF with a hard `error: character value is out of range` (no diag number to suppress). The 8-entry
    constexpr lookup table is rewritten as a `switch` returning the same values.
-3. **`sageattn3-pymodinit-func-export.patch`** — `csrc/blackwell/api.cu`, `csrc/quantization/fp4_quantization_4d.cu`:
-   the dummy module init functions were declared `PyObject* PyInit_x(void)` without `dllexport`. setuptools
-   84 does not pass `/EXPORT:PyInit_x` to `link.exe`, so the first build imported with
-   `ImportError: dynamic module does not define module export function (PyInit_fp4attn_cuda)`.
-   Changed to `PyMODINIT_FUNC` (= `extern "C" __declspec(dllexport) PyObject*`), as sageattention 2's own
-   `pybind.cpp` does.
-4. **`flash-attn-setup-cxx20-zc-preprocessor.patch`** — `setup.py`: the Windows branch forces
+3–4. **`sageattn3-setup-gpuless-cutlass-pin-cxx20.patch`** and **`sageattn3-msvc-kernel-params-by-pointer.patch`**:
+   see [sageattn3 1.0.0.post1](#sageattn3-100post1) above.
+5. **`flash-attn-setup-cxx20-zc-preprocessor.patch`** — `setup.py`: the Windows branch forces
    `/std:c++17` (cl) and `-std=c++17` (nvcc), but torch 2.15's headers require C++20 (`std::bit_width`,
    `std::strong_ordering`, designated initializers), and CUDA 13's CCCL `#error`s on MSVC's traditional
    preprocessor. Switched to C++20 and added `/Zc:preprocessor` for both cl and nvcc.
@@ -112,6 +147,6 @@ For every wheel (`build/verify_wheels.ps1`, full output in the release's `verify
    torch's own CUDA 13.4 DLLs.
 3. `cuobjdump --list-elf` shows `sm_120a` (or `sm_120` for flash-attn) cubins in every CUDA module;
    `--list-ptx` is empty (SASS-only builds).
-4. Wheel tags from the `WHEEL` metadata: `cp310-abi3-win_amd64` (sageattention, sageattn3 — stable ABI),
-   `cp313-cp313-win_amd64` (nunchaku, flash_attn).
-5. No local user paths in any `.pyd` (`/pathmap` is applied by the SageAttention setups; checked by string search).
+4. Wheel tags from the `WHEEL` metadata: `cp310-abi3-win_amd64` (sageattention — stable ABI),
+   `cp313-cp313-win_amd64` (sageattn3, nunchaku, flash_attn).
+5. No local user paths in any wheel file (checked by string search; cubins carry `-lineinfo` source paths under `C:/b/src` only).
