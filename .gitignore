@@ -1,0 +1,5 @@
+# Wheels are published as GitHub Release assets, never committed.
+*.whl
+*.zip
+*.log
+__pycache__/
